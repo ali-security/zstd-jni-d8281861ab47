@@ -93,6 +93,9 @@ public class ZstdOutputStreamNoFinalizer extends FilterOutputStream {
      * Default: false
      */
     public synchronized ZstdOutputStreamNoFinalizer setChecksum(boolean useChecksums) throws IOException {
+        if (isClosed) {
+            throw new IOException("StreamClosed");
+        }
         if (!frameClosed) {
             throw new IllegalStateException("Change of parameter on initialized stream");
         }

@@ -36,6 +36,35 @@ class ZstdDictSpec extends AnyFlatSpec {
     }
   }
 
+  // (offset, length) pairs that point outside of a 16 bytes dictionary buffer
+  val invalidDictRanges = List(
+    (0, 4096),              // length past the end of the buffer
+    (0, 50000000),          // length far past the end of the buffer
+    (8, 9),                 // offset + length past the end of the buffer
+    (8, Int.MaxValue),      // offset + length overflows
+    (-1, 16),               // negative offset
+    (-16, 8),               // negative offset
+    (Int.MinValue, 16),     // negative offset, dict.length - offset overflows
+    (0, -1),                // negative length
+    (17, 0)                 // offset past the end of the buffer
+  )
+
+  for ((offset, length) <- invalidDictRanges) {
+    it should s"reject ZstdDictCompress with out of bounds offset $offset and length $length" in {
+      val dictBuff = new Array[Byte](16)
+      intercept[IllegalArgumentException] {
+        new ZstdDictCompress(dictBuff, offset, length, 1)
+      }
+    }
+
+    it should s"reject ZstdDictDecompress with out of bounds offset $offset and length $length" in {
+      val dictBuff = new Array[Byte](16)
+      intercept[IllegalArgumentException] {
+        new ZstdDictDecompress(dictBuff, offset, length)
+      }
+    }
+  }
+
   val input = source.toArray
   val legacyS = List(true, false)
   val levels = List(1)
@@ -74,6 +103,20 @@ class ZstdDictSpec extends AnyFlatSpec {
       val compressed = Zstd.compress(input, cdict)
       cdict.close
       val ddict = new ZstdDictDecompress(dict)
+      val decompressed = Zstd.decompress(compressed, ddict, size)
+      ddict.close
+      assert(Zstd.getDictIdFromFrame(compressed) == Zstd.getDictIdFromDict(dict))
+      assert(input.toSeq == decompressed.toSeq)
+    }
+
+    it should s"round-trip compression/decompression with fast dict at offset at level $level with legacy $legacy" in {
+      val size = input.length
+      val offset = 7
+      val padded = Array.fill[Byte](offset)(42) ++ dict ++ Array.fill[Byte](13)(42)
+      val cdict = new ZstdDictCompress(padded, offset, dict.length, level)
+      val compressed = Zstd.compress(input, cdict)
+      cdict.close
+      val ddict = new ZstdDictDecompress(padded, offset, dict.length)
       val decompressed = Zstd.decompress(compressed, ddict, size)
       ddict.close
       assert(Zstd.getDictIdFromFrame(compressed) == Zstd.getDictIdFromDict(dict))
