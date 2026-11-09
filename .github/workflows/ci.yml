@@ -1,5 +1,11 @@
 name: CI
-on: [push, pull_request]
+on:
+    workflow_dispatch:
+        inputs:
+            test-filter:
+                description: 'sbt testOnly selector (empty = full suite)'
+                required: false
+                default: ''
 jobs:
     linux:
         strategy:
@@ -9,12 +15,19 @@ jobs:
                     { os: ubuntu-latest, target: linux/amd64 }
                 ]
         runs-on: ${{ matrix.os }}
+        # glibc 2.31 container (same image upstream's qemu-cross action uses) so the
+        # shipped linux/amd64 .so does not pick up GLIBC_2.34+ symbols from the runner
+        container: eclipse-temurin:11-jdk-focal
+        timeout-minutes: 45
         steps:
         - uses: actions/checkout@v3
         - uses: actions/setup-java@v3
           with:
             java-version: 11
             distribution: zulu
+
+        - name: Install gcc
+          run: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y gcc
 
         - name: Compile
           run: ./sbt compile
@@ -25,11 +38,19 @@ jobs:
         - name: Inspect
           run: ldd target/classes/${{ matrix.target }}/libzstd-jni-${nativeJniVersion}.so
 
-        - name: Test
-          run: ./sbt jacoco
+        - name: Check glibc symbol versions (<= 2.17)
+          run: |
+            objdump -T target/classes/${{ matrix.target }}/libzstd-jni-${nativeJniVersion}.so | grep -o 'GLIBC_[0-9.]*' | sort -uV > /tmp/glibc.txt
+            cat /tmp/glibc.txt
+            if awk -F'[_.]' '{ if ($2 > 2 || ($2 == 2 && $3 > 17)) bad=1 } END { exit !bad }' /tmp/glibc.txt; then echo "too-new glibc symbol"; exit 1; fi
 
-        - name: Upload coverage
-          uses: codecov/codecov-action@v3
+        - name: Test
+          run: |
+            if [ -n "${{ inputs.test-filter }}" ]; then
+              ./sbt "testOnly ${{ inputs.test-filter }}"
+            else
+              ./sbt jacoco
+            fi
 
         - name: Deploy
           if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master'}}
@@ -44,10 +65,11 @@ jobs:
             fail-fast: false
             matrix:
                 include: [
-                    { os: macos-11.0, host_arch: x86_64, macos_target: x86_64-apple-macos10.12, target_arch: x86_64  },
-                    { os: macos-11.0, host_arch: x86_64, macos_target: arm64-apple-macos11,     target_arch: aarch64 }
+                    { os: macos-15-intel, host_arch: x86_64,  macos_target: x86_64-apple-macos10.12, target_arch: x86_64  },
+                    { os: macos-latest,   host_arch: aarch64, macos_target: arm64-apple-macos11,     target_arch: aarch64 }
                 ]
         runs-on: ${{ matrix.os }}
+        timeout-minutes: 45
         steps:
         - uses: actions/checkout@v3
         - uses: actions/setup-java@v3
@@ -76,11 +98,24 @@ jobs:
 
         - name: Test
           if: matrix.target_arch == 'x86_64'
-          run: ./sbt jacoco
+          run: |
+            if [ -n "${{ inputs.test-filter }}" ]; then
+              ./sbt "testOnly ${{ inputs.test-filter }}"
+            else
+              ./sbt jacoco
+            fi
 
-        - name: Upload coverage
-          if: matrix.target_arch == 'x86_64'
-          uses: codecov/codecov-action@v3
+        - name: Stage native library
+          run: |
+            mkdir -p stage/darwin
+            cp -r target/classes/darwin/${{ matrix.host_arch }} stage/darwin/${{ matrix.target_arch }}
+            tar cf native-darwin-${{ matrix.target_arch }}.tar -C stage darwin
+
+        - uses: actions/upload-artifact@v4
+          with:
+            name: native-darwin-${{ matrix.target_arch }}
+            path: native-darwin-${{ matrix.target_arch }}.tar
+            if-no-files-found: error
 
         - name: Deploy
           if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master'}}
@@ -99,6 +134,7 @@ jobs:
                     { msystem: MINGW32, arch: i686,   java_arch: x86, target: 'win\x86',   s3_path: win/x86 }
                 ]
         runs-on: windows-latest
+        timeout-minutes: 45
         defaults:
             run:
                 shell: msys2 {0}
@@ -123,10 +159,24 @@ jobs:
           run: ./sbt compile
 
         - name: Test
-          run: ./sbt jacoco
+          run: |
+            if [ -n "${{ inputs.test-filter }}" ]; then
+              ./sbt "testOnly ${{ inputs.test-filter }}"
+            else
+              ./sbt jacoco
+            fi
 
-        - name: Upload coverage
-          uses: codecov/codecov-action@v3
+        - name: Stage native library
+          run: |
+            mkdir -p stage/win
+            cp -r target/classes/${{ matrix.s3_path }} stage/win/
+            tar cf native-win-${{ matrix.arch }}.tar -C stage win
+
+        - uses: actions/upload-artifact@v4
+          with:
+            name: native-win-${{ matrix.arch }}
+            path: native-win-${{ matrix.arch }}.tar
+            if-no-files-found: error
 
         - name: Deploy
           if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master'}}
@@ -136,3 +186,202 @@ jobs:
             AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
             AWS_DEFAULT_REGION: "us-east-1"
           run: 'aws s3 cp --recursive target\classes\${{ matrix.target }} s3://zstd-jni/github/${{ matrix.s3_path }}'
+
+    # Linux architectures the release builds off-CI: arm/s390x via upstream's
+    # make_so_cross.sh (Debian 12 cross gcc, as the published libs were built),
+    # the make_so.sh targets with Ubuntu 20.04 cross gcc (glibc <= 2.31) using
+    # make_so.sh's compile line, loongarch64 with Ubuntu 24.04's gcc-13 cross.
+    linux-cross:
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+        steps:
+        - uses: actions/checkout@v4
+
+        - name: make_so_cross.sh (arm, s390x)
+          run: |
+            docker run --rm -v "$PWD":/w -w /w debian:bookworm bash -c \
+              'set -e; apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq rsync gcc-arm-linux-gnueabihf gcc-s390x-linux-gnu; ./make_so_cross.sh'
+
+        - name: make_so.sh targets (i386, aarch64, ppc64, ppc64le, mips64)
+          run: |
+            docker run --rm -i -v "$PWD":/w -w /w ubuntu:20.04 bash -s <<'EOF'
+            set -e
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gcc-i686-linux-gnu gcc-aarch64-linux-gnu gcc-powerpc64-linux-gnu gcc-powerpc64le-linux-gnu gcc-mipsel-linux-gnu
+            VERSION=$(cat version)
+            compile () {
+                ARCH=$1
+                CC=$2
+                INSTALL=target/classes/linux/$ARCH
+                mkdir -p $INSTALL
+                $CC -Wl,--version-script=./libzstd-jni.so.map -shared -flto -fPIC -O3 -DZSTD_LEGACY_SUPPORT=4 -DZSTD_MULTITHREAD=1 -I/usr/include -I./jni -I./src/main/native -I./src/main/native/common -I./src/main/native/legacy -std=c99 -lpthread -o $INSTALL/libzstd-jni-$VERSION.so src/main/native/*.c src/main/native/legacy/*.c src/main/native/common/*.c src/main/native/compress/*.c src/main/native/decompress/*.[cS] src/main/native/dictBuilder/*.c
+            }
+            compile i386    "i686-linux-gnu-gcc -march=i586 -static-libgcc" &
+            compile ppc64   "powerpc64-linux-gnu-gcc -static-libgcc" &
+            compile ppc64le "powerpc64le-linux-gnu-gcc -static-libgcc" &
+            compile aarch64 "aarch64-linux-gnu-gcc -static-libgcc" &
+            # the published linux/mips64 library is a 32-bit little-endian MIPS (o32) object
+            compile mips64  "mipsel-linux-gnu-gcc -static-libgcc" &
+            wait
+            EOF
+
+        - name: loongarch64
+          run: |
+            docker run --rm -i -v "$PWD":/w -w /w ubuntu:24.04 bash -s <<'EOF'
+            set -e
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gcc-13-loongarch64-linux-gnu
+            VERSION=$(cat version)
+            INSTALL=target/classes/linux/loongarch64
+            mkdir -p $INSTALL
+            loongarch64-linux-gnu-gcc-13 -static-libgcc -Wl,--version-script=./libzstd-jni.so.map -shared -flto -fPIC -O3 -DZSTD_LEGACY_SUPPORT=4 -DZSTD_MULTITHREAD=1 -I/usr/include -I./jni -I./src/main/native -I./src/main/native/common -I./src/main/native/legacy -std=c99 -lpthread -o $INSTALL/libzstd-jni-$VERSION.so src/main/native/*.c src/main/native/legacy/*.c src/main/native/common/*.c src/main/native/compress/*.c src/main/native/decompress/*.[cS] src/main/native/dictBuilder/*.c
+            EOF
+
+        - name: Inspect
+          run: |
+            V=`cat version`
+            for a in i386 aarch64 arm ppc64 ppc64le mips64 loongarch64 s390x; do
+              f=target/classes/linux/$a/libzstd-jni-$V.so
+              echo "$f: $(file -b $f)"
+              objdump -T $f | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+            done
+            tar cf native-linux-cross.tar -C target/classes linux
+
+        - uses: actions/upload-artifact@v4
+          with:
+            name: native-linux-cross
+            path: native-linux-cross.tar
+            if-no-files-found: error
+
+    freebsd:
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+        steps:
+        - uses: actions/checkout@v4
+
+        - name: make_so.sh freebsd targets (amd64, i386)
+          uses: vmactions/freebsd-vm@v1
+          with:
+            # FreeBSD 12.x like the published libraries, so they load on 12+
+            release: "12.4"
+            usesh: true
+            copyback: true
+            run: |
+              set -e
+              VERSION=$(cat version)
+              compile () {
+                  ARCH=$1
+                  CC=$2
+                  INSTALL=target/classes/freebsd/$ARCH
+                  mkdir -p $INSTALL
+                  $CC -Wl,--version-script=./libzstd-jni.so.map -shared -flto -fPIC -O3 -DZSTD_LEGACY_SUPPORT=4 -DZSTD_MULTITHREAD=1 -I/usr/include -I./jni -I./src/main/native -I./src/main/native/common -I./src/main/native/legacy -std=c99 -lpthread -o $INSTALL/libzstd-jni-$VERSION.so src/main/native/*.c src/main/native/legacy/*.c src/main/native/common/*.c src/main/native/compress/*.c src/main/native/decompress/*.[cS] src/main/native/dictBuilder/*.c
+              }
+              compile amd64 "cc"
+              compile i386  "cc -m32 -march=i486 -mfancy-math-387"
+              file target/classes/freebsd/*/*.so
+
+        - name: Stage native libraries
+          run: |
+            ls -la target/classes/freebsd/*/
+            tar cf native-freebsd.tar -C target/classes freebsd
+
+        - uses: actions/upload-artifact@v4
+          with:
+            name: native-freebsd
+            path: native-freebsd.tar
+            if-no-files-found: error
+
+    # Android .aar: the exact command build.sbt's aarTask runs (`gradle assembleRelease`
+    # + copy to target/<name>-<version>.aar), with the toolchain the published aar
+    # records (NDK r19c, AGP 3.3.0 on Gradle 4.10.1 / JDK 8).
+    android:
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+        steps:
+        - uses: actions/checkout@v4
+
+        - name: Install Android SDK components
+          run: |
+            SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+            yes | "$SDKM" --licenses > /dev/null
+            "$SDKM" "platforms;android-26" "build-tools;28.0.3" "cmake;3.6.4111459" "ndk;19.2.5345600" > /dev/null
+            printf 'sdk.dir=%s\nndk.dir=%s\n' "$ANDROID_HOME" "$ANDROID_HOME/ndk/19.2.5345600" > local.properties
+
+        - uses: actions/setup-java@v4
+          with:
+            java-version: 8
+            distribution: zulu
+
+        - name: Install Gradle 4.10.1
+          run: |
+            curl -sSfL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-4.10.1-bin.zip
+            unzip -q /tmp/gradle.zip -d /opt
+            echo "/opt/gradle-4.10.1/bin" >> $GITHUB_PATH
+
+        - name: aar
+          run: |
+            gradle assembleRelease
+            mkdir -p target
+            # AGP names the aar after the checkout directory (zstd-jni-release.aar upstream)
+            cp build/outputs/aar/*-release.aar target/zstd-jni-`cat version`.aar
+            unzip -l target/zstd-jni-`cat version`.aar
+
+        - uses: actions/upload-artifact@v4
+          with:
+            name: zstd-jni-aar
+            path: target/zstd-jni-*.aar
+            if-no-files-found: error
+
+    # Release packaging: all native libraries in target/classes, then the OSGi
+    # bundle (main jar) and every classified jar from build.sbt.
+    package:
+        needs: [linux, macos, windows, linux-cross, freebsd]
+        runs-on: ubuntu-latest
+        container: eclipse-temurin:11-jdk-focal
+        timeout-minutes: 45
+        steps:
+        - uses: actions/checkout@v3
+        - uses: actions/setup-java@v3
+          with:
+            java-version: 11
+            distribution: zulu
+
+        - name: Install gcc
+          run: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y gcc
+
+        - name: Compile
+          run: ./sbt compile
+
+        - uses: actions/download-artifact@v4
+          with:
+            pattern: native-*
+            path: natives
+            merge-multiple: true
+
+        - name: Collect native libraries
+          run: |
+            for t in natives/*.tar; do tar xf $t -C target/classes; done
+            V=`cat version`
+            for p in darwin/x86_64/libzstd-jni-$V.dylib darwin/aarch64/libzstd-jni-$V.dylib \
+                     freebsd/amd64/libzstd-jni-$V.so freebsd/i386/libzstd-jni-$V.so \
+                     linux/aarch64/libzstd-jni-$V.so linux/amd64/libzstd-jni-$V.so linux/arm/libzstd-jni-$V.so \
+                     linux/i386/libzstd-jni-$V.so linux/mips64/libzstd-jni-$V.so linux/loongarch64/libzstd-jni-$V.so \
+                     linux/ppc64/libzstd-jni-$V.so linux/ppc64le/libzstd-jni-$V.so linux/s390x/libzstd-jni-$V.so \
+                     win/amd64/libzstd-jni-$V.dll win/x86/libzstd-jni-$V.dll; do
+              ls -la target/classes/$p
+            done
+
+        - name: Package
+          run: |
+            ./sbt osgiBundle linux_amd64:package linux_i386:package linux_aarch64:package linux_arm:package \
+                  linux_ppc64le:package linux_ppc64:package linux_mips64:package linux_loongarch64:package \
+                  linux_s390x:package darwin_x86_64:package darwin_aarch64:package freebsd_amd64:package \
+                  freebsd_i386:package win_x86:package win_amd64:package
+            ls -la target/*.jar
+            for j in target/zstd-jni-*.jar; do echo "== $j"; jar tf $j | grep -v '\.class$'; done
+
+        - uses: actions/upload-artifact@v4
+          with:
+            name: zstd-jni-jars
+            path: target/zstd-jni-*.jar
+            if-no-files-found: error
