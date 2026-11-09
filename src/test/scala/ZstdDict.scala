@@ -36,6 +36,20 @@ class ZstdDictSpec extends AnyFlatSpec {
     }
   }
 
+  it should "reject trainFromBufferDirect sample sizes exceeding the samples buffer" in {
+    val samples = ByteBuffer.allocateDirect(1024)
+    val dictBuf = ByteBuffer.allocateDirect(1024)
+    // total of the sample sizes is past the end of the samples buffer
+    assert(Zstd.isError(Zstd.trainFromBufferDirect(samples, Array(512, 512, 4096), dictBuf, false)))
+    assert(Zstd.isError(Zstd.trainFromBufferDirect(samples, Array(512, 512, 4096), dictBuf, true)))
+    assert(Zstd.isError(Zstd.trainFromBufferDirect(ByteBuffer.allocateDirect(16), Array(100, 100), dictBuf, true)))
+    // sum of the sample sizes wraps around a 32-bit size_t
+    assert(Zstd.isError(Zstd.trainFromBufferDirect(samples, Array(Int.MaxValue, Int.MaxValue, 2), dictBuf, true)))
+    // negative sample size
+    assert(Zstd.isError(Zstd.trainFromBufferDirect(samples, Array(512, -1, 512), dictBuf, false)))
+    assert(Zstd.isError(Zstd.trainFromBufferDirect(samples, Array(-1), dictBuf, true)))
+  }
+
   // (offset, length) pairs that point outside of a 16 bytes dictionary buffer
   val invalidDictRanges = List(
     (0, 4096),              // length past the end of the buffer
