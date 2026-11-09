@@ -1228,4 +1228,37 @@ class ZstdSpec extends AnyFlatSpec with ScalaCheckPropertyChecks {
       }
     }.get
   }
+
+  "Zstd" should "reject negative or overflowing offset/size in decompressedDirectByteBufferSize" in {
+    val input = "foo bar baz".getBytes("UTF-8")
+    val compressed = Zstd.compress(input)
+    val buf = ByteBuffer.allocateDirect(64)
+    buf.put(compressed)
+    buf.flip()
+
+    def isGeneric(r: Long): Boolean = Zstd.isError(r) && Zstd.getErrorCode(r) == Zstd.errGeneric()
+
+    // sanity: in-range call still works
+    assert(Zstd.decompressedDirectByteBufferSize(buf, 0, compressed.length) == input.length)
+    assert(Zstd.decompressedDirectByteBufferSize(buf, 0, compressed.length, false) == input.length)
+
+    // negative size must be rejected (not converted into a huge size_t)
+    assert(isGeneric(Zstd.decompressedDirectByteBufferSize(buf, 0, -1)))
+    assert(isGeneric(Zstd.decompressedDirectByteBufferSize(buf, 0, Int.MinValue, false)))
+    assert(isGeneric(Zstd.decompressedDirectByteBufferSize(buf, 0, -1, true)))
+
+    // offset + size overflowing a 32-bit int must be rejected
+    assert(isGeneric(Zstd.decompressedDirectByteBufferSize(buf, 1, Int.MaxValue)))
+    assert(isGeneric(Zstd.decompressedDirectByteBufferSize(buf, Int.MaxValue, Int.MaxValue, false)))
+    assert(isGeneric(Zstd.decompressedDirectByteBufferSize(buf, Int.MaxValue, 16, true)))
+
+    // offset/size just past the capacity must be rejected
+    assert(isGeneric(Zstd.decompressedDirectByteBufferSize(buf, 0, buf.capacity() + 1)))
+    assert(isGeneric(Zstd.decompressedDirectByteBufferSize(buf, buf.capacity(), 1)))
+
+    // negative offsets must be rejected (would read before the buffer start)
+    assert(isGeneric(Zstd.decompressedDirectByteBufferSize(buf, -1, 1)))
+    assert(isGeneric(Zstd.decompressedDirectByteBufferSize(buf, -2000000000, 16)))
+    assert(isGeneric(Zstd.decompressedDirectByteBufferSize(buf, Int.MinValue, 16, true)))
+  }
 }
