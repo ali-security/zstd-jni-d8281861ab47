@@ -37,6 +37,8 @@ public class ZstdInputStreamNoFinalizer extends FilterInputStream {
     private boolean isContinuous = false;
     private boolean frameFinished = true;
     private boolean isClosed = false;
+    // the dictionary currently referenced by the native stream (if any)
+    private ZstdDictDecompress active_dict = null;
 
     /* JNI methods */
     public static native long recommendedDInSize();
@@ -89,6 +91,9 @@ public class ZstdInputStreamNoFinalizer extends FilterInputStream {
     }
 
     public synchronized ZstdInputStreamNoFinalizer setDict(byte[] dict) throws IOException {
+        if (isClosed) {
+            throw new IOException("Stream closed");
+        }
         int size = Zstd.loadDictDecompress(stream, dict, dict.length);
         if (Zstd.isError(size)) {
             throw new ZstdIOException(size);
@@ -97,19 +102,32 @@ public class ZstdInputStreamNoFinalizer extends FilterInputStream {
     }
 
     public synchronized ZstdInputStreamNoFinalizer setDict(ZstdDictDecompress dict) throws IOException {
-        dict.acquireSharedLock();
-        try {
-            int size = Zstd.loadFastDictDecompress(stream, dict);
-            if (Zstd.isError(size)) {
-                throw new ZstdIOException(size);
-            }
-        } finally {
-            dict.releaseSharedLock();
+        if (isClosed) {
+            throw new IOException("Stream closed");
         }
+        if (dict != null) {
+            dict.acquireSharedLock();
+        }
+        int size = Zstd.loadFastDictDecompress(stream, dict);
+        if (Zstd.isError(size)) {
+            if (dict != null) {
+                dict.releaseSharedLock();
+            }
+            throw new ZstdIOException(size);
+        }
+        // release the shared lock on the previously used dict (if any)
+        if (active_dict != null) {
+            active_dict.releaseSharedLock();
+        }
+        // keep the dict alive so it's not garbage collected
+        active_dict = dict;
         return this;
     }
 
     public synchronized ZstdInputStreamNoFinalizer setLongMax(int windowLogMax) throws IOException {
+        if (isClosed) {
+            throw new IOException("Stream closed");
+        }
         int size = Zstd.setDecompressionLongMax(stream, windowLogMax);
         if (Zstd.isError(size)) {
             throw new ZstdIOException(size);
@@ -256,6 +274,10 @@ public class ZstdInputStreamNoFinalizer extends FilterInputStream {
     public synchronized void close() throws IOException {
         if (isClosed) {
             return;
+        }
+        if (active_dict != null) {
+            active_dict.releaseSharedLock();
+            active_dict = null;
         }
         isClosed = true;
         bufferPool.release(srcByteBuffer);

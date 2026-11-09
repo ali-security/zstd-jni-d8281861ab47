@@ -910,6 +910,68 @@ class ZstdSpec extends AnyFlatSpec with ScalaCheckPropertyChecks {
     }
   }
 
+  it should s"throw on setting parameters on closed stream" in {
+    val os  = new ByteArrayOutputStream(100)
+    val zos = new ZstdOutputStreamNoFinalizer(os, 1)
+    zos.close()
+    assertThrows[IOException] {
+      zos.setLevel(3)
+    }
+    assertThrows[IOException] {
+      zos.setLong(20)
+    }
+    assertThrows[IOException] {
+      zos.setWorkers(0)
+    }
+    assertThrows[IOException] {
+      zos.setDict(Array.fill[Byte](1024)(42))
+    }
+    val cdict = new ZstdDictCompress(Array.fill[Byte](1024)(42), 1)
+    assertThrows[IOException] {
+      zos.setDict(cdict)
+    }
+    // the dict is not retained by the closed stream
+    cdict.close()
+  }
+
+  it should s"do not cause a segmentation fault in setDict(ZstdDictCompress)" in {
+    val os  = new ByteArrayOutputStream(100)
+    val zos = new ZstdOutputStream(os)
+    assertThrows[ZstdIOException] {
+      zos.setDict(null.asInstanceOf[ZstdDictCompress])
+    }
+    assert(Zstd.loadFastDictCompress(0, null.asInstanceOf[ZstdDictCompress]) == -32)
+  }
+
+  "ZstdInputStream" should s"throw on setting parameters on closed stream" in {
+    val zis = new ZstdInputStreamNoFinalizer(new ByteArrayInputStream(Array[Byte]()))
+    zis.close()
+    assertThrows[IOException] {
+      zis.setLongMax(20)
+    }
+    assertThrows[IOException] {
+      zis.setDict(Array.fill[Byte](1024)(42))
+    }
+    val ddict = new ZstdDictDecompress(Array.fill[Byte](1024)(42))
+    assertThrows[IOException] {
+      zis.setDict(ddict)
+    }
+    // the dict is not retained by the closed stream
+    ddict.close()
+  }
+
+  "Zstd" should s"do not cause a segmentation fault in loadFastDictDecompress()" in {
+    val zin = new ZstdInputStreamNoFinalizer(new ByteArrayInputStream(Array[Byte]()))
+    assertThrows[ZstdIOException] {
+      zin.setDict(null.asInstanceOf[ZstdDictDecompress])
+    }
+    // Avoid:
+    // 0 0x0000000103a067c8 AccessInternal::PostRuntimeDispatch<G1BarrierSet::AccessBarrier<548964ull, G1BarrierSet>,
+    //   (AccessInternal::BarrierType)2, 548964ull>::oop_access_barrier(void*) + 8 in libjvm.dylib
+    // 1 0x0000000103daa0f8 jni_GetObjectClass + 184 in libjvm.dylib
+    assert(Zstd.loadFastDictDecompress(0, null.asInstanceOf[ZstdDictDecompress]) == -32)
+  }
+
   "ZstdDirectBufferCompressingStream" should s"do nothing on double close but throw on writing on closed stream" in {
     val os  = ByteBuffer.allocateDirect(100)
     val zos = new ZstdDirectBufferCompressingStream(os, 1)
