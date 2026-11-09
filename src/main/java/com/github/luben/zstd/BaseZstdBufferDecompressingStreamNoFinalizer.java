@@ -10,6 +10,8 @@ public abstract class BaseZstdBufferDecompressingStreamNoFinalizer implements Cl
     protected boolean closed = false;
     private boolean finishedFrame = false;
     private boolean streamEnd = false;
+    // the dictionary currently referenced by the native stream (if any)
+    private ZstdDictDecompress active_dict = null;
     private int consumed;
     private int produced;
 
@@ -28,10 +30,16 @@ public abstract class BaseZstdBufferDecompressingStreamNoFinalizer implements Cl
     }
 
     public boolean hasRemaining() {
-        return !streamEnd && (source.hasRemaining() || !finishedFrame);
+        return !closed && !streamEnd && (source.hasRemaining() || !finishedFrame);
     }
 
     public BaseZstdBufferDecompressingStreamNoFinalizer setDict(byte[] dict) throws IOException {
+        if (dict == null) {
+            throw new NullPointerException("dict");
+        }
+        if (closed) {
+            throw new IOException("Stream closed");
+        }
         long size = Zstd.loadDictDecompress(stream, dict, dict.length);
         if (Zstd.isError(size)) {
             throw new ZstdIOException(size);
@@ -40,19 +48,33 @@ public abstract class BaseZstdBufferDecompressingStreamNoFinalizer implements Cl
     }
 
     public BaseZstdBufferDecompressingStreamNoFinalizer setDict(ZstdDictDecompress dict) throws IOException {
-        dict.acquireSharedLock();
-        try {
-            long size = Zstd.loadFastDictDecompress(stream, dict);
-            if (Zstd.isError(size)) {
-                throw new ZstdIOException(size);
-            }
-        } finally {
-            dict.releaseSharedLock();
+        if (dict == null) {
+            throw new NullPointerException("dict");
         }
+        if (closed) {
+            throw new IOException("Stream closed");
+        }
+        // the native stream keeps referencing the dict, so hold its shared lock
+        // (it can't be closed and freed) for as long as it is in use
+        dict.acquireSharedLock();
+        long size = Zstd.loadFastDictDecompress(stream, dict);
+        if (Zstd.isError(size)) {
+            dict.releaseSharedLock();
+            throw new ZstdIOException(size);
+        }
+        // release the shared lock on the previously used dict (if any)
+        if (active_dict != null) {
+            active_dict.releaseSharedLock();
+        }
+        // keep the dict alive so it's not garbage collected
+        active_dict = dict;
         return this;
     }
 
     public BaseZstdBufferDecompressingStreamNoFinalizer setLongMax(int windowLogMax) throws IOException {
+        if (closed) {
+            throw new IOException("Stream closed");
+        }
         long size = Zstd.setDecompressionLongMax(stream, windowLogMax);
         if (Zstd.isError(size)) {
             throw new ZstdIOException(size);
@@ -103,6 +125,11 @@ public abstract class BaseZstdBufferDecompressingStreamNoFinalizer implements Cl
             } finally {
                 closed = true;
                 source = null; // help GC with realizing the buffer can be released
+                // the native stream is freed, release the dict it was referencing (if any)
+                if (active_dict != null) {
+                    active_dict.releaseSharedLock();
+                    active_dict = null;
+                }
             }
         }
     }

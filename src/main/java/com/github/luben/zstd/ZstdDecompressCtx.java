@@ -36,6 +36,11 @@ public class ZstdDecompressCtx extends AutoCloseBase {
             free(nativePtr);
             nativePtr = 0;
         }
+        // release the shared lock on the dict referenced by the native context (if any)
+        if (decompression_dict != null) {
+            decompression_dict.releaseSharedLock();
+            decompression_dict = null;
+        }
     }
 
     /**
@@ -58,16 +63,26 @@ public class ZstdDecompressCtx extends AutoCloseBase {
     public ZstdDecompressCtx loadDict(ZstdDictDecompress dict) {
         ensureOpen();
         acquireSharedLock();
-        dict.acquireSharedLock();
         try {
+            // the native context keeps referencing the dict, so hold its shared lock
+            // (it can't be closed and freed) for as long as it is in use
+            if (dict != null) {
+                dict.acquireSharedLock();
+            }
             long result = loadDDictFast0(nativePtr, dict);
             if (Zstd.isError(result)) {
+                if (dict != null) {
+                    dict.releaseSharedLock();
+                }
                 throw new ZstdException(result);
+            }
+            // release the shared lock on the previously used dict (if any)
+            if (decompression_dict != null) {
+                decompression_dict.releaseSharedLock();
             }
             // keep a reference to the dictionary so it's not garbage collected
             decompression_dict = dict;
         } finally {
-            dict.releaseSharedLock();
             releaseSharedLock();
         }
         return this;
@@ -87,7 +102,11 @@ public class ZstdDecompressCtx extends AutoCloseBase {
             if (Zstd.isError(result)) {
                 throw new ZstdException(result);
             }
-            decompression_dict = null;
+            // the native context doesn't reference the previously used dict anymore
+            if (decompression_dict != null) {
+                decompression_dict.releaseSharedLock();
+                decompression_dict = null;
+            }
         } finally {
             releaseSharedLock();
         }
@@ -101,7 +120,17 @@ public class ZstdDecompressCtx extends AutoCloseBase {
      */
     public void reset() {
         ensureOpen();
-        reset0(nativePtr);
+        acquireSharedLock();
+        try {
+            reset0(nativePtr);
+            // the reset context doesn't reference the previously used dict anymore
+            if (decompression_dict != null) {
+                decompression_dict.releaseSharedLock();
+                decompression_dict = null;
+            }
+        } finally {
+            releaseSharedLock();
+        }
     }
     private static native void reset0(long nativePtr);
 

@@ -526,4 +526,407 @@ class ZstdDictSpec extends AnyFlatSpec {
     zos.close
     cdict1.close
   }
+
+  // The native compression/decompression contexts keep referencing the fast dicts
+  // loaded in them, so a dict must stay locked (it can not be closed and freed)
+  // while a context uses it.
+  "ZstdCompressCtx" should "keep the fast dict locked while it is loaded" in {
+    val size = input.length
+    val cdict = new ZstdDictCompress(streamDict, 1)
+    val cctx = new ZstdCompressCtx()
+    cctx.loadDict(cdict)
+    // closing the dict while the context references it must not free it
+    intercept[IllegalStateException] {
+      cdict.close
+    }
+    // the context can still use the dict
+    val compressed = cctx.compress(input)
+    cctx.close
+    // closing the context releases the dict
+    cdict.close
+    assert(Zstd.getDictIdFromFrame(compressed) == Zstd.getDictIdFromDict(streamDict))
+    val decompressed = Zstd.decompress(compressed, streamDict, size)
+    assert(input.toSeq == decompressed.toSeq)
+  }
+
+  it should "release the lock of the previous fast dict when loading a new one" in {
+    val size = input.length
+    val cdict1 = new ZstdDictCompress(streamDict, 1)
+    val cdict2 = new ZstdDictCompress(streamDict, 1)
+    val cctx = new ZstdCompressCtx()
+    cctx.loadDict(cdict1)
+    cctx.loadDict(cdict2)
+    // the context does not reference the first dict anymore
+    cdict1.close
+    intercept[IllegalStateException] {
+      cdict2.close
+    }
+    val compressed = cctx.compress(input)
+    cctx.close
+    cdict2.close
+    val decompressed = Zstd.decompress(compressed, streamDict, size)
+    assert(input.toSeq == decompressed.toSeq)
+  }
+
+  it should "release the lock of the fast dict when loading a byte[] dict" in {
+    val size = input.length
+    val cdict = new ZstdDictCompress(streamDict, 1)
+    val cctx = new ZstdCompressCtx()
+    cctx.loadDict(cdict)
+    cctx.loadDict(streamDict)
+    // the context does not reference the fast dict anymore
+    cdict.close
+    val compressed = cctx.compress(input)
+    cctx.close
+    assert(Zstd.getDictIdFromFrame(compressed) == Zstd.getDictIdFromDict(streamDict))
+    val decompressed = Zstd.decompress(compressed, streamDict, size)
+    assert(input.toSeq == decompressed.toSeq)
+  }
+
+  it should "release the lock of the fast dict when removing it" in {
+    val size = input.length
+    val cdict = new ZstdDictCompress(streamDict, 1)
+    val cctx = new ZstdCompressCtx()
+    cctx.loadDict(cdict)
+    cctx.loadDict(null.asInstanceOf[ZstdDictCompress])
+    // the context does not reference the fast dict anymore
+    cdict.close
+    val compressed = cctx.compress(input)
+    cctx.close
+    assert(Zstd.getDictIdFromFrame(compressed) == 0)
+    assert(input.toSeq == Zstd.decompress(compressed, size).toSeq)
+  }
+
+  it should "release the lock of the fast dict when the context is reset" in {
+    val size = input.length
+    val cdict = new ZstdDictCompress(streamDict, 1)
+    val cctx = new ZstdCompressCtx()
+    cctx.loadDict(cdict)
+    cctx.reset()
+    // the context does not reference the fast dict anymore
+    cdict.close
+    val compressed = cctx.compress(input)
+    cctx.close
+    assert(Zstd.getDictIdFromFrame(compressed) == 0)
+    assert(input.toSeq == Zstd.decompress(compressed, size).toSeq)
+  }
+
+  it should "keep the current fast dict locked when loading a new one fails" in {
+    val cdict1 = new ZstdDictCompress(streamDict, 1)
+    val cdict2 = new ZstdDictCompress(streamDict, 1)
+    val cctx = new ZstdCompressCtx()
+    cctx.loadDict(cdict1)
+    // start a frame, the dict can't be changed in the middle of it
+    val src = ByteBuffer.allocateDirect(1024)
+    src.put(input, 0, 1024)
+    src.flip()
+    val dst = ByteBuffer.allocateDirect(Zstd.compressBound(1024).toInt)
+    cctx.compressDirectByteBufferStream(dst, src, EndDirective.CONTINUE)
+    intercept[ZstdException] {
+      cctx.loadDict(cdict2)
+    }
+    // the failed call did not keep the new dict locked
+    cdict2.close
+    // the context still references the first dict
+    intercept[IllegalStateException] {
+      cdict1.close
+    }
+    cctx.close
+    cdict1.close
+  }
+
+  "ZstdDecompressCtx" should "keep the fast dict locked while it is loaded" in {
+    val size = input.length
+    val compressed = Zstd.compressUsingDict(input, streamDict, 1)
+    val ddict = new ZstdDictDecompress(streamDict)
+    val dctx = new ZstdDecompressCtx()
+    dctx.loadDict(ddict)
+    // closing the dict while the context references it must not free it
+    intercept[IllegalStateException] {
+      ddict.close
+    }
+    // the context can still use the dict
+    val decompressed = dctx.decompress(compressed, size)
+    dctx.close
+    // closing the context releases the dict
+    ddict.close
+    assert(input.toSeq == decompressed.toSeq)
+  }
+
+  it should "release the lock of the previous fast dict when loading a new one" in {
+    val size = input.length
+    val compressed = Zstd.compressUsingDict(input, streamDict, 1)
+    val ddict1 = new ZstdDictDecompress(streamDict)
+    val ddict2 = new ZstdDictDecompress(streamDict)
+    val dctx = new ZstdDecompressCtx()
+    dctx.loadDict(ddict1)
+    dctx.loadDict(ddict2)
+    // the context does not reference the first dict anymore
+    ddict1.close
+    intercept[IllegalStateException] {
+      ddict2.close
+    }
+    val decompressed = dctx.decompress(compressed, size)
+    dctx.close
+    ddict2.close
+    assert(input.toSeq == decompressed.toSeq)
+  }
+
+  it should "release the lock of the fast dict when loading a byte[] dict" in {
+    val size = input.length
+    val compressed = Zstd.compressUsingDict(input, streamDict, 1)
+    val ddict = new ZstdDictDecompress(streamDict)
+    val dctx = new ZstdDecompressCtx()
+    dctx.loadDict(ddict)
+    dctx.loadDict(streamDict)
+    // the context does not reference the fast dict anymore
+    ddict.close
+    val decompressed = dctx.decompress(compressed, size)
+    dctx.close
+    assert(input.toSeq == decompressed.toSeq)
+  }
+
+  it should "release the lock of the fast dict when removing it" in {
+    val size = input.length
+    val compressed = Zstd.compressUsingDict(input, streamDict, 1)
+    val ddict = new ZstdDictDecompress(streamDict)
+    val dctx = new ZstdDecompressCtx()
+    dctx.loadDict(ddict)
+    dctx.loadDict(null.asInstanceOf[ZstdDictDecompress])
+    // the context does not reference the fast dict anymore
+    ddict.close
+    intercept[ZstdException] {
+      dctx.decompress(compressed, size)
+    }
+    dctx.close
+  }
+
+  it should "release the lock of the fast dict when the context is reset" in {
+    val size = input.length
+    val compressed = Zstd.compressUsingDict(input, streamDict, 1)
+    val ddict = new ZstdDictDecompress(streamDict)
+    val dctx = new ZstdDecompressCtx()
+    dctx.loadDict(ddict)
+    dctx.reset()
+    // the context does not reference the fast dict anymore
+    ddict.close
+    intercept[ZstdException] {
+      dctx.decompress(compressed, size)
+    }
+    dctx.close
+  }
+
+  it should "keep the current fast dict locked when loading a new one fails" in {
+    val compressed = Zstd.compressUsingDict(input, streamDict, 1)
+    val ddict1 = new ZstdDictDecompress(streamDict)
+    val ddict2 = new ZstdDictDecompress(streamDict)
+    val dctx = new ZstdDecompressCtx()
+    dctx.loadDict(ddict1)
+    // start decompressing a frame, the dict can't be changed in the middle of it
+    val src = ByteBuffer.allocateDirect(compressed.length)
+    src.put(compressed, 0, 4)
+    src.flip()
+    val dst = ByteBuffer.allocateDirect(input.length)
+    dctx.decompressDirectByteBufferStream(dst, src)
+    intercept[ZstdException] {
+      dctx.loadDict(ddict2)
+    }
+    // the failed call did not keep the new dict locked
+    ddict2.close
+    // the context still references the first dict
+    intercept[IllegalStateException] {
+      ddict1.close
+    }
+    dctx.close
+    ddict1.close
+  }
+
+  "ZstdDirectBufferCompressingStream" should "keep the fast dict locked while in use by the stream" in {
+    val size = input.length
+    val cdict = new ZstdDictCompress(streamDict, 1)
+    val target = ByteBuffer.allocateDirect(Zstd.compressBound(size.toLong).toInt)
+    val zos = new ZstdDirectBufferCompressingStream(target, 1)
+    zos.setDict(cdict)
+    // closing the dict before the stream starts using it must not free it
+    intercept[IllegalStateException] {
+      cdict.close
+    }
+    val src = ByteBuffer.allocateDirect(size)
+    src.put(input)
+    src.flip()
+    src.limit(size / 2)
+    zos.compress(src)
+    // closing the dict in the middle of the frame must not free it
+    intercept[IllegalStateException] {
+      cdict.close
+    }
+    // the stream can still use the dict
+    src.limit(size)
+    zos.compress(src)
+    zos.close
+    // closing the stream releases the dict
+    cdict.close
+    target.flip()
+    val compressed = new Array[Byte](target.remaining)
+    target.get(compressed)
+    assert(Zstd.getDictIdFromFrame(compressed) == Zstd.getDictIdFromDict(streamDict))
+    val decompressed = Zstd.decompress(compressed, streamDict, size)
+    assert(input.toSeq == decompressed.toSeq)
+  }
+
+  "ZstdDirectBufferCompressingStreamNoFinalizer" should "release the lock of the previous fast dict when setting a new dict" in {
+    val size = input.length
+    val cdict1 = new ZstdDictCompress(streamDict, 1)
+    val cdict2 = new ZstdDictCompress(streamDict, 1)
+    val cdict3 = new ZstdDictCompress(streamDict, 1)
+    val target = ByteBuffer.allocateDirect(Zstd.compressBound(size.toLong).toInt)
+    val zos = new ZstdDirectBufferCompressingStreamNoFinalizer(target, 1)
+    zos.setDict(cdict1)
+    zos.setDict(cdict2)
+    // the stream does not reference the first dict anymore
+    cdict1.close
+    intercept[IllegalStateException] {
+      cdict2.close
+    }
+    zos.setDict(streamDict)
+    // the stream does not reference the second dict anymore
+    cdict2.close
+    zos.setDict(cdict3)
+    val src = ByteBuffer.allocateDirect(size)
+    src.put(input)
+    src.flip()
+    zos.compress(src)
+    intercept[IllegalStateException] {
+      cdict3.close
+    }
+    zos.close
+    cdict3.close
+    target.flip()
+    val compressed = new Array[Byte](target.remaining)
+    target.get(compressed)
+    val decompressed = Zstd.decompress(compressed, streamDict, size)
+    assert(input.toSeq == decompressed.toSeq)
+  }
+
+  it should "not keep the fast dict locked when set on a closed stream" in {
+    val zos = new ZstdDirectBufferCompressingStreamNoFinalizer(ByteBuffer.allocateDirect(100), 1)
+    zos.close()
+    val cdict = new ZstdDictCompress(streamDict, 1)
+    intercept[IllegalStateException] {
+      zos.setDict(cdict)
+    }
+    // the dict is not retained by the closed stream
+    cdict.close
+  }
+
+  def newBufferDecompressingStream(direct: Boolean, compressed: Array[Byte]): BaseZstdBufferDecompressingStreamNoFinalizer =
+    if (direct) {
+      val source = ByteBuffer.allocateDirect(compressed.length)
+      source.put(compressed)
+      source.flip()
+      new ZstdDirectBufferDecompressingStreamNoFinalizer(source)
+    } else {
+      new ZstdBufferDecompressingStreamNoFinalizer(ByteBuffer.wrap(compressed))
+    }
+
+  def newTargetBuffer(direct: Boolean, size: Int): ByteBuffer =
+    if (direct) ByteBuffer.allocateDirect(size) else ByteBuffer.allocate(size)
+
+  def readBufferStream(zis: BaseZstdBufferDecompressingStreamNoFinalizer, direct: Boolean, size: Int): Array[Byte] = {
+    val output = Array.fill[Byte](size)(0)
+    val block = newTargetBuffer(direct, 128 * 1024)
+    var offset = 0
+    while (zis.hasRemaining) {
+      block.clear()
+      val read = zis.read(block)
+      block.flip()
+      block.get(output, offset, read)
+      offset += read
+    }
+    assert(offset == size)
+    output
+  }
+
+  for (direct <- List(true, false)) {
+    val streamName =
+      if (direct) "ZstdDirectBufferDecompressingStreamNoFinalizer"
+      else "ZstdBufferDecompressingStreamNoFinalizer"
+
+    streamName should "keep the fast dict locked while in use by the stream" in {
+      val size = input.length
+      val compressed = Zstd.compressUsingDict(input, streamDict, 1)
+      val ddict = new ZstdDictDecompress(streamDict)
+      val zis = newBufferDecompressingStream(direct, compressed)
+      zis.setDict(ddict)
+      // closing the dict while the stream references it must not free it
+      intercept[IllegalStateException] {
+        ddict.close
+      }
+      // the stream can still use the dict
+      val output = readBufferStream(zis, direct, size)
+      zis.close
+      // closing the stream releases the dict
+      ddict.close
+      assert(input.toSeq == output.toSeq)
+    }
+
+    it should "release the lock of the previous fast dict when setting a new one" in {
+      val size = input.length
+      val compressed = Zstd.compressUsingDict(input, streamDict, 1)
+      val ddict1 = new ZstdDictDecompress(streamDict)
+      val ddict2 = new ZstdDictDecompress(streamDict)
+      val zis = newBufferDecompressingStream(direct, compressed)
+      zis.setDict(ddict1)
+      zis.setDict(ddict2)
+      // the stream does not reference the first dict anymore
+      ddict1.close
+      intercept[IllegalStateException] {
+        ddict2.close
+      }
+      val output = readBufferStream(zis, direct, size)
+      zis.close
+      ddict2.close
+      assert(input.toSeq == output.toSeq)
+    }
+
+    it should "keep the current fast dict locked when setting a new one fails" in {
+      val compressed = Zstd.compressUsingDict(input, streamDict, 1)
+      val ddict1 = new ZstdDictDecompress(streamDict)
+      val ddict2 = new ZstdDictDecompress(streamDict)
+      val zis = newBufferDecompressingStream(direct, compressed)
+      zis.setDict(ddict1)
+      // start decompressing the frame, the dict can't be changed in the middle of it
+      zis.read(newTargetBuffer(direct, 1))
+      intercept[ZstdIOException] {
+        zis.setDict(ddict2)
+      }
+      // the failed call did not keep the new dict locked
+      ddict2.close
+      // the stream still references the first dict
+      intercept[IllegalStateException] {
+        ddict1.close
+      }
+      zis.close
+      ddict1.close
+    }
+
+    it should "throw on setting parameters on closed stream" in {
+      val compressed = Zstd.compressUsingDict(input, streamDict, 1)
+      val zis = newBufferDecompressingStream(direct, compressed)
+      zis.close
+      assert(!zis.hasRemaining)
+      intercept[IOException] {
+        zis.setLongMax(20)
+      }
+      intercept[IOException] {
+        zis.setDict(streamDict)
+      }
+      val ddict = new ZstdDictDecompress(streamDict)
+      intercept[IOException] {
+        zis.setDict(ddict)
+      }
+      // the dict is not retained by the closed stream
+      ddict.close
+    }
+  }
 }
